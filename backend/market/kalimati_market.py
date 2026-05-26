@@ -1,11 +1,10 @@
 """
-Kalimati Market — scraper + SQLite data layer.
+Kalimati Market - scraper + SQLite data layer.
 Fetches daily vegetable/fruit prices from kalimatimarket.gov.np and stores them locally.
 """
 from __future__ import annotations
 
 import datetime
-import re
 import time
 from pathlib import Path
 
@@ -19,7 +18,7 @@ from sqlalchemy.orm import DeclarativeBase, Session, relationship
 
 from backend.market.kalimati_translations import translate_name, translate_unit
 
-# ── Database ──────────────────────────────────────────────────────────────────
+# -- Database -----------------------------------------------------------------
 
 DB_PATH = Path(__file__).parent / "kalimati.db"
 _engine = create_engine(f"sqlite:///{DB_PATH}", echo=False)
@@ -31,36 +30,42 @@ class _Base(DeclarativeBase):
 
 class KCommodity(_Base):
     __tablename__ = "k_commodities"
-    id            = Column(Integer, primary_key=True, autoincrement=True)
-    name_nepali   = Column(String, unique=True, nullable=False)
-    name_english  = Column(String, nullable=False)
-    unit_nepali   = Column(String)
-    unit_english  = Column(String)
-    prices        = relationship("KPrice", back_populates="commodity",
-                                 cascade="all, delete-orphan")
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    name_nepali = Column(String, unique=True, nullable=False)
+    name_english = Column(String, nullable=False)
+    unit_nepali = Column(String)
+    unit_english = Column(String)
+    prices = relationship(
+        "KPrice",
+        back_populates="commodity",
+        cascade="all, delete-orphan",
+    )
 
 
 class KPrice(_Base):
     __tablename__ = "k_prices"
-    id            = Column(Integer, primary_key=True, autoincrement=True)
-    commodity_id  = Column(Integer, ForeignKey("k_commodities.id"), nullable=False)
-    date          = Column(String, nullable=False)   # YYYY-MM-DD
-    min_price     = Column(Float)
-    max_price     = Column(Float)
-    avg_price     = Column(Float)
-    scraped_at    = Column(DateTime, default=datetime.datetime.now)
-    commodity     = relationship("KCommodity", back_populates="prices")
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    commodity_id = Column(Integer, ForeignKey("k_commodities.id"), nullable=False)
+    date = Column(String, nullable=False)  # YYYY-MM-DD
+    min_price = Column(Float)
+    max_price = Column(Float)
+    avg_price = Column(Float)
+    scraped_at = Column(DateTime, default=datetime.datetime.now)
+    commodity = relationship("KCommodity", back_populates="prices")
 
 
 def init_kalimati_db() -> None:
     _Base.metadata.create_all(_engine)
 
 
-# ── Scraper ───────────────────────────────────────────────────────────────────
+# -- Scraper ------------------------------------------------------------------
 
+_API_URLS = [
+    "https://kalimatimarket.gov.np/api/daily-prices/en",
+]
 _PRICE_URLS = [
-    "https://kalimatimarket.gov.np/lang/en/price",
     "https://kalimatimarket.gov.np/price",
+    "https://kalimatimarket.gov.np/lang/en/price",
 ]
 _HEADERS = {
     "User-Agent": (
@@ -68,6 +73,7 @@ _HEADERS = {
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/122.0.0.0 Safari/537.36"
     ),
+    "Accept": "application/json,text/html;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9,ne;q=0.8",
 }
 _DIGIT_MAP = str.maketrans("०१२३४५६७८९", "0123456789")
@@ -88,9 +94,48 @@ def _is_english(text: str) -> bool:
     return sum(1 for c in text if c.isascii() and c.isalpha()) > len(text) * 0.5
 
 
+def _rows_from_api_payload(payload: dict) -> list[dict]:
+    api_date = str(payload.get("date") or datetime.date.today().isoformat())[:10]
+    prices = payload.get("prices") if isinstance(payload, dict) else None
+    if not isinstance(prices, list):
+        return []
+
+    rows = []
+    for item in prices:
+        if not isinstance(item, dict):
+            continue
+        name_raw = str(item.get("commodityname") or item.get("name") or "").strip()
+        unit_raw = str(item.get("commodityunit") or item.get("unit") or "").strip()
+        avg_v = _to_float(str(item.get("avgprice") or item.get("avg") or ""))
+        if not name_raw or avg_v is None:
+            continue
+        rows.append({
+            "name_nepali": name_raw,
+            "name_english": name_raw if _is_english(name_raw) else translate_name(name_raw),
+            "unit_nepali": unit_raw,
+            "unit_english": translate_unit(unit_raw),
+            "min": _to_float(str(item.get("minprice") or item.get("min") or "")) or 0.0,
+            "max": _to_float(str(item.get("maxprice") or item.get("max") or "")) or 0.0,
+            "avg": avg_v,
+            "date": api_date,
+        })
+    return rows
+
+
 def fetch_kalimati_prices(timeout: int = 15) -> list[dict]:
-    """Scrape Kalimati market. Returns list of dicts with name/unit/min/max/avg."""
+    """Fetch Kalimati market prices. Returns list of dicts with name/unit/min/max/avg."""
     last_err = None
+    for url in _API_URLS:
+        try:
+            resp = requests.get(url, headers=_HEADERS, timeout=timeout)
+            resp.raise_for_status()
+            rows = _rows_from_api_payload(resp.json())
+            if rows:
+                return rows
+        except Exception as e:
+            last_err = e
+            time.sleep(1)
+
     for url in _PRICE_URLS:
         try:
             resp = requests.get(url, headers=_HEADERS, timeout=timeout)
@@ -113,9 +158,9 @@ def fetch_kalimati_prices(timeout: int = 15) -> list[dict]:
                     continue
                 name_raw = tds[0].get_text(strip=True)
                 unit_raw = tds[1].get_text(strip=True) if len(tds) > 4 else ""
-                min_v  = _to_float(tds[-3].get_text(strip=True))
-                max_v  = _to_float(tds[-2].get_text(strip=True))
-                avg_v  = _to_float(tds[-1].get_text(strip=True))
+                min_v = _to_float(tds[-3].get_text(strip=True))
+                max_v = _to_float(tds[-2].get_text(strip=True))
+                avg_v = _to_float(tds[-1].get_text(strip=True))
                 if not name_raw or avg_v is None:
                     continue
 
@@ -126,12 +171,11 @@ def fetch_kalimati_prices(timeout: int = 15) -> list[dict]:
                     name_np = name_raw
                     name_en = translate_name(name_raw)
 
-                unit_en = translate_unit(unit_raw)
                 rows.append({
                     "name_nepali": name_np,
                     "name_english": name_en,
                     "unit_nepali": unit_raw,
-                    "unit_english": unit_en,
+                    "unit_english": translate_unit(unit_raw),
                     "min": min_v or 0.0,
                     "max": max_v or 0.0,
                     "avg": avg_v,
@@ -144,7 +188,7 @@ def fetch_kalimati_prices(timeout: int = 15) -> list[dict]:
     raise RuntimeError(f"Kalimati fetch failed: {last_err}")
 
 
-# ── DB write ──────────────────────────────────────────────────────────────────
+# -- DB write -----------------------------------------------------------------
 
 def store_kalimati_prices(rows: list[dict], date: str | None = None) -> int:
     """Store scraped rows into DB. Returns number stored."""
@@ -167,7 +211,8 @@ def store_kalimati_prices(rows: list[dict], date: str | None = None) -> int:
                     comm.name_english = r["name_english"]
 
             existing = session.query(KPrice).filter_by(
-                commodity_id=comm.id, date=date
+                commodity_id=comm.id,
+                date=date,
             ).first()
             if existing:
                 existing.min_price = r["min"]
@@ -186,7 +231,7 @@ def store_kalimati_prices(rows: list[dict], date: str | None = None) -> int:
     return len(rows)
 
 
-# ── DB read ───────────────────────────────────────────────────────────────────
+# -- DB read ------------------------------------------------------------------
 
 def get_kalimati_display_rows() -> list[dict]:
     """Return latest price row per commodity with prev-day change calculation."""
@@ -200,7 +245,6 @@ def get_kalimati_display_rows() -> list[dict]:
             .scalar()
         )
 
-        # Build prev-day map
         prev_map: dict[int, float] = {}
         if prev_date:
             for p, c in (
@@ -248,10 +292,11 @@ def refresh_kalimati() -> tuple[list[dict], str]:
     """Fetch + store + return display rows. Returns (rows, status_msg)."""
     try:
         raw = fetch_kalimati_prices()
-        n = store_kalimati_prices(raw)
+        price_date = next((str(r.get("date"))[:10] for r in raw if r.get("date")), None)
+        n = store_kalimati_prices(raw, date=price_date)
         rows = get_kalimati_display_rows()
         ts = datetime.datetime.now().strftime("%H:%M:%S")
         return rows, f"Kalimati: {n} items  Updated {ts}"
     except Exception as e:
-        rows = get_kalimati_display_rows()  # return cached
+        rows = get_kalimati_display_rows()
         return rows, f"Kalimati fetch failed: {e}"

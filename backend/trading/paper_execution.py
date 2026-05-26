@@ -57,6 +57,14 @@ from validation.transaction_costs import TransactionCostModel as NepseFees
 PAPER_ORDER_STATUSES = {"OPEN", "FILLED", "CANCELLED", "REJECTED"}
 
 
+def _positive_float(value: Any) -> Optional[float]:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number > 0 else None
+
+
 @dataclass
 class PaperOrder:
     order_id: str
@@ -257,11 +265,10 @@ class PaperExecutionService:
         self.account_id = str(account_id or "account_1")
         self.account_dir = Path(account_dir) if account_dir else Path(get_runtime_dir(__file__)) / "accounts" / self.account_id
         ensure_dir(self.account_dir)
-        self.initial_capital = float(initial_capital)
+        self.configured_initial_capital = float(initial_capital)
         self.strategy_id = str(strategy_id or "")
         self.max_positions = int(max_positions)
         self.sector_limit = float(sector_limit)
-        self.max_order_notional = float(max_order_notional or (self.initial_capital / max(1, self.max_positions)))
         self.max_quote_age_seconds = int(max_quote_age_seconds)
         self.max_daily_turnover_pct = float(max_daily_turnover_pct)
         self.max_daily_loss_pct = float(max_daily_loss_pct)
@@ -276,8 +283,41 @@ class PaperExecutionService:
         self.structured_log_file = self.account_dir / "paper_execution.jsonl"
         self.manifest_dir = ensure_dir(self.account_dir / "strategy_runs")
 
+        self.initial_capital = self._resolve_account_initial_capital(self.configured_initial_capital)
+        self.max_order_notional = float(max_order_notional or (self.initial_capital / max(1, self.max_positions)))
+
         self._ensure_files()
         self._migrate_legacy_tui_files()
+
+    def _resolve_account_initial_capital(self, fallback: float) -> float:
+        """Prefer account seed NAV over the global strategy default."""
+        state = load_runtime_state(str(self.state_file))
+        for key in ("initial_capital", "daily_start_nav"):
+            value = _positive_float(state.get(key) if isinstance(state, dict) else None)
+            if value is not None:
+                return value
+
+        if self.nav_log_file.exists():
+            try:
+                nav_df = pd.read_csv(self.nav_log_file)
+                if not nav_df.empty and "NAV" in nav_df.columns:
+                    value = _positive_float(nav_df.iloc[0].get("NAV"))
+                    if value is not None:
+                        return value
+            except Exception:
+                pass
+
+        cash = _positive_float(state.get("cash") if isinstance(state, dict) else None)
+        if cash is not None:
+            try:
+                has_positions = bool(load_portfolio(str(self.portfolio_file)))
+                has_trades = not load_trade_log_df(str(self.trade_log_file)).empty
+            except Exception:
+                has_positions = has_trades = False
+            if not has_positions and not has_trades:
+                return cash
+
+        return float(fallback)
 
     def _ensure_files(self) -> None:
         _ensure_csv(self.portfolio_file, PORTFOLIO_COLS)
@@ -286,7 +326,11 @@ class PaperExecutionService:
         if not self.state_file.exists():
             save_runtime_state(
                 str(self.state_file),
-                {"cash": self.initial_capital, "daily_start_nav": self.initial_capital},
+                {
+                    "cash": self.initial_capital,
+                    "daily_start_nav": self.initial_capital,
+                    "initial_capital": self.initial_capital,
+                },
             )
         if not self.orders_file.exists():
             _write_json_locked(self.orders_file, [])
@@ -340,6 +384,7 @@ class PaperExecutionService:
                 positions = load_portfolio(str(self.portfolio_file))
                 state["cash"] = max(0.0, self.initial_capital - sum(pos.cost_basis for pos in positions.values()))
         state.setdefault("daily_start_nav", self.initial_capital)
+        state.setdefault("initial_capital", self.initial_capital)
         state.setdefault("manual_halt", False)
         return state
 
@@ -451,7 +496,14 @@ class PaperExecutionService:
         positions = load_portfolio(str(self.portfolio_file))
         nav = float(state.get("cash") or 0.0) + sum(pos.market_value for pos in positions.values())
         daily_start_nav = float(state.get("daily_start_nav") or nav or self.initial_capital)
-        peak_nav = float(state.get("peak_nav") or max(daily_start_nav, nav, self.initial_capital))
+        raw_peak_nav = _positive_float(state.get("peak_nav"))
+        if (
+            raw_peak_nav is not None
+            and raw_peak_nav == self.configured_initial_capital
+            and self.configured_initial_capital > self.initial_capital
+        ):
+            raw_peak_nav = None
+        peak_nav = float(raw_peak_nav or max(daily_start_nav, nav, self.initial_capital))
         state["peak_nav"] = max(peak_nav, nav)
         self._save_state(state)
 

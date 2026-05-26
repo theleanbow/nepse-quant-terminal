@@ -584,7 +584,11 @@ def _build_account_seed_state(portfolio_df: pd.DataFrame, target_nav: float) -> 
     if cash < 0:
         raise ValueError(f"Target NAV is below current marked portfolio value {_npr_k(positions_value)}")
     today = datetime.now().strftime("%Y-%m-%d")
-    state = {"cash": cash, "daily_start_nav": round(float(target_nav), 2)}
+    state = {
+        "cash": cash,
+        "daily_start_nav": round(float(target_nav), 2),
+        "initial_capital": round(float(target_nav), 2),
+    }
     nav_log = pd.DataFrame(
         [
             {
@@ -969,6 +973,50 @@ def _load_manual_paper_cash(total_cost: float, nav_log: Optional[pd.DataFrame] =
         except Exception:
             pass
     return max(0.0, float(INITIAL_CAPITAL) - float(total_cost))
+
+
+def _positive_float(value) -> Optional[float]:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number > 0 else None
+
+
+def _account_initial_capital_from_files(account_dir: Path, fallback: float = INITIAL_CAPITAL) -> float:
+    state_path = account_dir / "paper_state.json"
+    nav_path = account_dir / "paper_nav_log.csv"
+    portfolio_path = account_dir / "paper_portfolio.csv"
+    trade_log_path = account_dir / "paper_trade_log.csv"
+
+    state = load_runtime_state(str(state_path))
+    if isinstance(state, dict):
+        for key in ("initial_capital", "daily_start_nav"):
+            value = _positive_float(state.get(key))
+            if value is not None:
+                return value
+
+    if nav_path.exists():
+        try:
+            nav_log = pd.read_csv(nav_path)
+            if not nav_log.empty and "NAV" in nav_log.columns:
+                value = _positive_float(nav_log.iloc[0].get("NAV"))
+                if value is not None:
+                    return value
+        except Exception:
+            pass
+
+    cash = _positive_float(state.get("cash") if isinstance(state, dict) else None)
+    if cash is not None:
+        try:
+            portfolio = pd.read_csv(portfolio_path) if portfolio_path.exists() else pd.DataFrame()
+            trades = pd.read_csv(trade_log_path) if trade_log_path.exists() else pd.DataFrame()
+        except Exception:
+            portfolio = trades = pd.DataFrame()
+        if portfolio.empty and trades.empty:
+            return cash
+
+    return float(fallback)
 
 
 def _tms_health_flag(health: dict, key: str) -> bool:
@@ -2396,6 +2444,7 @@ def _compute_account_portfolio_stats(md: MD, account_dir: Path) -> dict:
     port = pd.read_csv(_port_path) if _port_path.exists() else pd.DataFrame()
     nav_log = pd.read_csv(_nav_path) if _nav_path.exists() else pd.DataFrame()
     trade_log = pd.read_csv(_tl_path) if _tl_path.exists() else pd.DataFrame()
+    account_capital = _account_initial_capital_from_files(account_dir)
 
     positions = []
     total_cost = total_value = 0.0
@@ -2437,7 +2486,7 @@ def _compute_account_portfolio_stats(md: MD, account_dir: Path) -> dict:
             })
 
     # Cash from paper_state.json
-    cash = float(INITIAL_CAPITAL)
+    cash = float(account_capital)
     if _state_path.exists():
         try:
             _ps = _json.loads(_state_path.read_text())
@@ -2447,13 +2496,13 @@ def _compute_account_portfolio_stats(md: MD, account_dir: Path) -> dict:
         except Exception:
             pass
     elif total_cost > 0:
-        cash = max(0.0, float(INITIAL_CAPITAL) - total_cost)
+        cash = max(0.0, float(account_capital) - total_cost)
 
     nav = cash + total_value
-    baseline_nav = float(INITIAL_CAPITAL)
+    baseline_nav = float(account_capital)
     if not nav_log.empty and "NAV" in nav_log.columns:
         try:
-            baseline_nav = float(nav_log.iloc[0]["NAV"] or INITIAL_CAPITAL)
+            baseline_nav = float(nav_log.iloc[0]["NAV"] or account_capital)
         except Exception:
             pass
     total_return = (nav - baseline_nav) / baseline_nav * 100 if baseline_nav > 0 else 0.0
@@ -4309,10 +4358,11 @@ class NepseDashboard(App):
         if block_reason:
             return block_reason
         account_id = str(getattr(self, "__dict__", {}).get("_current_account_id", "") or "account_1")
+        account_dir = _account_dir(account_id)
         service = PaperExecutionService(
             account_id,
-            account_dir=_account_dir(account_id),
-            initial_capital=float(INITIAL_CAPITAL),
+            account_dir=account_dir,
+            initial_capital=_account_initial_capital_from_files(account_dir),
         )
         result = service.submit_order(
             account_id,
@@ -4433,10 +4483,11 @@ class NepseDashboard(App):
             return
 
         account_id = str(getattr(self, "__dict__", {}).get("_current_account_id", "") or "account_1")
+        account_dir = _account_dir(account_id)
         service = PaperExecutionService(
             account_id,
-            account_dir=_account_dir(account_id),
-            initial_capital=float(INITIAL_CAPITAL),
+            account_dir=account_dir,
+            initial_capital=_account_initial_capital_from_files(account_dir),
         )
         result = service.match_open_orders(
             account_id,
@@ -4846,8 +4897,12 @@ class NepseDashboard(App):
             strategy = strategy_registry.load_strategy(strategy_id) if strategy_id else None
             config = dict((strategy or {}).get("config") or {}) or dict(LONG_TERM_CONFIG)
             account_dir = _account_dir(account_id)
+            account_capital = _account_initial_capital_from_files(
+                account_dir,
+                float(config.get("initial_capital") or INITIAL_CAPITAL),
+            )
             engine = TUITradingEngine(
-                capital=float(config.get("initial_capital") or INITIAL_CAPITAL),
+                capital=account_capital,
                 signal_types=list(config.get("signal_types") or list(LONG_TERM_CONFIG.get("signal_types") or [])),
                 max_positions=int(config.get("max_positions") or LONG_TERM_CONFIG.get("max_positions") or 5),
                 holding_days=int(config.get("holding_days") or LONG_TERM_CONFIG.get("holding_days") or 40),
@@ -7811,7 +7866,20 @@ class NepseDashboard(App):
         if not isinstance(cash, (int, float)):
             cash = _load_manual_paper_cash(0.0, nav_log)
         nav_value = None
-        if isinstance(nav_log, pd.DataFrame) and not nav_log.empty and "NAV" in nav_log.columns:
+        if account_dir and hasattr(self, "md"):
+            try:
+                stats = _compute_account_portfolio_stats(self.md, account_dir)
+                nav_value = float(stats.get("nav") or 0.0)
+                cash = float(stats.get("cash") or cash)
+            except Exception:
+                nav_value = None
+        elif not account_dir and isinstance(getattr(self, "_stats", None), dict) and self._stats:
+            try:
+                nav_value = float(self._stats.get("nav") or 0.0)
+                cash = float(self._stats.get("cash") or cash)
+            except Exception:
+                nav_value = None
+        if nav_value is None and isinstance(nav_log, pd.DataFrame) and not nav_log.empty and "NAV" in nav_log.columns:
             try:
                 nav_value = float(nav_log.iloc[-1]["NAV"])
             except Exception:
@@ -8152,8 +8220,12 @@ class NepseDashboard(App):
             _new_strategy = strategy_registry.load_strategy(strategy_registry.default_strategy_for_account(account_id))
             _new_config = dict((_new_strategy or {}).get("config") or {}) or dict(LONG_TERM_CONFIG)
             _new_adir = _account_dir(account_id)
+            _new_capital = _account_initial_capital_from_files(
+                _new_adir,
+                float(_new_config.get("initial_capital") or target_nav or INITIAL_CAPITAL),
+            )
             _new_engine = TUITradingEngine(
-                capital=float(_new_config.get("initial_capital") or INITIAL_CAPITAL),
+                capital=_new_capital,
                 signal_types=list(_new_config.get("signal_types") or list(LONG_TERM_CONFIG.get("signal_types") or [])),
                 max_positions=int(_new_config.get("max_positions") or LONG_TERM_CONFIG.get("max_positions") or 5),
                 holding_days=int(_new_config.get("holding_days") or LONG_TERM_CONFIG.get("holding_days") or 40),
@@ -8283,11 +8355,13 @@ class NepseDashboard(App):
         state = load_runtime_state(str(PAPER_STATE_FILE))
         state["cash"] = target_cash
         state["daily_start_nav"] = target_nav
+        state["initial_capital"] = target_nav
         save_runtime_state(str(PAPER_STATE_FILE), state)
 
         tui_state = load_runtime_state(str(TUI_PAPER_STATE_FILE))
         tui_state["cash"] = target_cash
         tui_state["daily_start_nav"] = target_nav
+        tui_state["initial_capital"] = target_nav
         save_runtime_state(str(TUI_PAPER_STATE_FILE), tui_state)
 
         nav_log = _load_nav_log()

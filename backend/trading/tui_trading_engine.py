@@ -68,6 +68,14 @@ LIVE_NAV_LOG_FILE = migrate_legacy_path(TRADING_RUNTIME_DIR / "paper_nav_log.csv
 LIVE_STATE_FILE = migrate_legacy_path(TRADING_RUNTIME_DIR / "paper_state.json", [PROJECT_ROOT / "paper_state.json"])
 
 
+def _positive_float(value) -> Optional[float]:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number > 0 else None
+
+
 class TUITradingEngine:
     """Self-contained paper trading engine for the TUI dashboard.
 
@@ -100,7 +108,7 @@ class TUITradingEngine:
         on_portfolio_changed: Optional[Callable[[], None]] = None,
         on_agent_updated: Optional[Callable[[], None]] = None,
     ):
-        self.capital = capital
+        self.configured_capital = float(capital)
         self.signal_types = signal_types or list(LONG_TERM_CONFIG["signal_types"])
         self.max_positions = max_positions
         self.holding_days = holding_days
@@ -118,6 +126,7 @@ class TUITradingEngine:
         self.account_id = str(account_id or "account_1")
         self.strategy_id = str(strategy_id or "")
         self.strategy_config = dict(strategy_config or {})
+        self.capital = self._resolve_account_capital(self.configured_capital)
         self._active_run_id = ""
         self._paper_execution = PaperExecutionService(
             self.account_id,
@@ -147,12 +156,18 @@ class TUITradingEngine:
         self._stop_flag: bool = False
         self._prices_df: Optional[pd.DataFrame] = None
         self._consecutive_losses: int = 0
-        self._daily_start_nav: float = capital
+        self._daily_start_nav: float = self.capital
+        self._peak_nav: float = self.capital
         self._halted: bool = False
         self._halt_reason: str = ""
 
         # Load persisted state
         self._load_state()
+        self._peak_nav = max(
+            float(self._peak_nav or 0.0),
+            float(self._daily_start_nav or 0.0),
+            self._calc_nav(),
+        )
 
     # ─── Status helpers ─────────────────────────────────────────────────────
 
@@ -187,6 +202,42 @@ class TUITradingEngine:
         )
 
     # ─── Persistence ────────────────────────────────────────────────────────
+
+    def _resolve_account_capital(self, fallback: float) -> float:
+        """Use the account's seeded NAV when it differs from strategy defaults."""
+        if self._state_file.exists():
+            try:
+                state = json.loads(self._state_file.read_text())
+            except Exception:
+                state = {}
+            if isinstance(state, dict):
+                for key in ("initial_capital", "daily_start_nav"):
+                    value = _positive_float(state.get(key))
+                    if value is not None:
+                        return value
+
+                cash = _positive_float(state.get("cash"))
+                if cash is not None:
+                    try:
+                        has_positions = bool(load_portfolio(str(self._portfolio_file)))
+                        trade_log = pd.read_csv(self._trade_log_file) if self._trade_log_file.exists() else pd.DataFrame()
+                        has_trades = not trade_log.empty
+                    except Exception:
+                        has_positions = has_trades = False
+                    if not has_positions and not has_trades:
+                        return cash
+
+        if self._nav_log_file.exists():
+            try:
+                nav_log = pd.read_csv(self._nav_log_file)
+                if not nav_log.empty and "NAV" in nav_log.columns:
+                    value = _positive_float(nav_log.iloc[0].get("NAV"))
+                    if value is not None:
+                        return value
+            except Exception:
+                pass
+
+        return float(fallback)
 
     def _load_state(self) -> None:
         """Resume from saved state, or bootstrap from existing paper portfolio."""
@@ -238,6 +289,12 @@ class TUITradingEngine:
                 self._last_signal_date = s.get("last_signal_date", "")
                 self._consecutive_losses = s.get("consecutive_losses", 0)
                 self._daily_start_nav = s.get("daily_start_nav", self.capital)
+                self._peak_nav = s.get("peak_nav", self._daily_start_nav or self.capital)
+                if (
+                    float(self._peak_nav or 0.0) == self.configured_capital
+                    and self.configured_capital > self.capital
+                ):
+                    self._peak_nav = max(float(self._daily_start_nav or 0.0), self._calc_nav(), self.capital)
                 self._eod_logged_date = s.get("eod_logged_date", "")
             except Exception:
                 pass
@@ -267,9 +324,11 @@ class TUITradingEngine:
         save_portfolio(self.positions, str(self._portfolio_file))
         state = {
             "cash": round(self.cash, 2),
+            "initial_capital": round(self.capital, 2),
             "last_signal_date": self._last_signal_date,
             "consecutive_losses": self._consecutive_losses,
             "daily_start_nav": round(self._daily_start_nav, 2),
+            "peak_nav": round(max(float(self._peak_nav or 0.0), self._calc_nav()), 2),
             "eod_logged_date": self._eod_logged_date,
             "timestamp": time.time(),
         }
@@ -632,6 +691,7 @@ class TUITradingEngine:
     def _check_kill_switch(self) -> None:
         """Halt trading if risk limits breached."""
         nav = self._calc_nav()
+        self._peak_nav = max(float(self._peak_nav or 0.0), nav, float(self._daily_start_nav or 0.0), self.capital)
 
         # Daily loss check (3%)
         if self._daily_start_nav > 0:
@@ -640,8 +700,8 @@ class TUITradingEngine:
                 self._halt("daily loss > 3%")
                 return
 
-        # Drawdown from capital (15%)
-        dd = (nav - self.capital) / self.capital
+        # Drawdown from the account peak NAV (15%).
+        dd = (nav - self._peak_nav) / self._peak_nav if self._peak_nav > 0 else 0.0
         if dd < -0.15:
             self._halt("drawdown > 15%")
             return
