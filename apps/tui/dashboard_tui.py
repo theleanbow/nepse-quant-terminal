@@ -3889,6 +3889,11 @@ class NepseDashboard(App):
         self._load_strategies_registry()
         self._apply_active_strategy_runtime()
         self._sync_agent_account_context_env()
+        try:
+            from backend.quant_pro.database import init_db
+            init_db()
+        except Exception:
+            pass
         # Pull live quotes into DB before loading market data
         try:
             from backend.quant_pro.realtime_market import get_market_data_provider
@@ -8896,7 +8901,7 @@ class NepseDashboard(App):
             broker_rows: list[list[Text]] = []
             top_broker_cols: list = []
             top_broker_rows: list[list[Text]] = []
-            broker_title = "BROKER FLOOR SIGNALS — Run floorsheet scraper to enable"
+            broker_title = "BROKER FLOOR SIGNALS — python3 -m backend.quant_pro.data_scrapers.floorsheet_ingestion"
             try:
                 import sqlite3 as _sqlite3
                 from backend.quant_pro.database import get_db_path as _get_db_path
@@ -8909,7 +8914,7 @@ class NepseDashboard(App):
                     ).fetchone() or [None])[0]
                 except Exception:
                     _latest_bdate = None
-                if False:  # broker signal computation not included in public release
+                if _latest_bdate:
                     _brows = _bconn.execute("""
                         SELECT b.symbol,
                                b.hhi_buy, b.hhi_sell,
@@ -8968,9 +8973,40 @@ class NepseDashboard(App):
                                  style=GAIN_HI if display_score > 0.15 else WHITE),
                             _dim_text(f"{trades:6d}"),
                         ])
-                # Top Brokers panel — populated by floorsheet scraper (not in public release)
-                top_broker_cols = []
-                top_broker_rows = []
+                    top_broker_cols = [
+                        ("BROKER", "tbroker", 8),
+                        ("BUY QTY", "tbuy", 10),
+                        ("SELL QTY", "tsell", 10),
+                        ("NET QTY", "tnet", 10),
+                        ("TRADES", "ttrades", 8),
+                    ]
+                    try:
+                        _top_rows = _bconn.execute("""
+                            SELECT broker_code,
+                                   SUM(buy_qty) AS buy_qty,
+                                   SUM(sell_qty) AS sell_qty,
+                                   SUM(net_qty) AS net_qty,
+                                   SUM(total_trades) AS total_trades
+                            FROM broker_summary
+                            WHERE as_of_date = ?
+                            GROUP BY broker_code
+                            ORDER BY ABS(SUM(net_qty)) DESC, SUM(total_trades) DESC
+                            LIMIT 25
+                        """, (_latest_bdate,)).fetchall()
+                    except Exception:
+                        _top_rows = []
+                    for _r in _top_rows:
+                        net_qty = int(_r["net_qty"] or 0)
+                        net_style = GAIN_HI if net_qty > 0 else (LOSS_HI if net_qty < 0 else DIM)
+                        top_broker_rows.append([
+                            Text(str(_r["broker_code"]), style=WHITE),
+                            _vol_text(int(_r["buy_qty"] or 0)),
+                            _vol_text(int(_r["sell_qty"] or 0)),
+                            Text(f"{net_qty:,}", style=net_style),
+                            _dim_text(f"{int(_r['total_trades'] or 0):,}"),
+                        ])
+                else:
+                    broker_rows.append([_dim_text("—"), _dim_text("Run floorsheet ingestion to populate broker data"), *[Text("")] * 6])
                 _bconn.close()
             except Exception as _be:
                 broker_rows.append([_dim_text("—"), _dim_text("Run floorsheet scraper to populate broker data"), *[Text("")] * 6])

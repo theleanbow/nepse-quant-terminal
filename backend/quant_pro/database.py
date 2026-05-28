@@ -90,6 +90,20 @@ def get_db_connection(timeout: float = 60.0, retries: int = 3) -> sqlite3.Connec
     raise DatabaseError(f"Failed to connect after {retries} attempts: {last_err}") from last_err
 
 
+def _dedupe_stock_prices(cursor: sqlite3.Cursor) -> None:
+    """Keep the newest row for each legacy duplicate (symbol, date) pair."""
+    cursor.execute(
+        '''
+        DELETE FROM stock_prices
+        WHERE rowid NOT IN (
+            SELECT MAX(rowid)
+            FROM stock_prices
+            GROUP BY symbol, date
+        )
+        '''
+    )
+
+
 def init_db():
     """Creates the table if it doesn't exist and configures WAL mode."""
     global _wal_initialized
@@ -119,6 +133,11 @@ def init_db():
             volume REAL,
             PRIMARY KEY (symbol, date)
         )
+    ''')
+    _dedupe_stock_prices(cursor)
+    cursor.execute('''
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_stock_prices_symbol_date_unique
+        ON stock_prices (symbol, date)
     ''')
 
     # Create index for faster symbol lookups if not exists
@@ -460,6 +479,59 @@ def init_db():
             flags TEXT,
             PRIMARY KEY (symbol, as_of_date)
         )
+        '''
+    )
+    cursor.execute(
+        '''
+        CREATE TABLE IF NOT EXISTS broker_signals_v2 (
+            symbol TEXT NOT NULL,
+            as_of_date DATE NOT NULL,
+            hhi_buy REAL,
+            hhi_sell REAL,
+            hhi_buy_norm REAL,
+            hhi_sell_norm REAL,
+            circular_score REAL,
+            top_pair_pct REAL,
+            self_trade_pct REAL,
+            smart_money_score REAL,
+            pump_score REAL,
+            total_volume INTEGER,
+            n_trades INTEGER,
+            n_brokers_buy INTEGER,
+            n_brokers_sell INTEGER,
+            PRIMARY KEY (symbol, as_of_date)
+        )
+        '''
+    )
+    cursor.execute(
+        '''
+        CREATE INDEX IF NOT EXISTS idx_bsv2_date
+        ON broker_signals_v2 (as_of_date)
+        '''
+    )
+    cursor.execute(
+        '''
+        CREATE TABLE IF NOT EXISTS broker_microstructure (
+            symbol TEXT NOT NULL,
+            as_of_date DATE NOT NULL,
+            amihud_illiq REAL,
+            roll_spread REAL,
+            cs_spread REAL,
+            kyle_lambda REAL,
+            kyle_pvalue REAL,
+            kyle_rsq REAL,
+            kyle_cwoib REAL,
+            kyle_significant INTEGER,
+            pin_proxy REAL,
+            micro_score REAL,
+            PRIMARY KEY (symbol, as_of_date)
+        )
+        '''
+    )
+    cursor.execute(
+        '''
+        CREATE INDEX IF NOT EXISTS idx_bmicro_date
+        ON broker_microstructure (as_of_date)
         '''
     )
     cursor.execute(
